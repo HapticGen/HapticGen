@@ -6,14 +6,24 @@
 """Dataset of audio with a simple description.
 """
 
+import copy
 from dataclasses import dataclass, fields, replace
 import json
+import logging
 from pathlib import Path
 import random
 import typing as tp
 
+from audiocraft.data.audio import audio_read
+from audiocraft.data.audio_dataset import AudioMeta, SegmentInfo
+from audiocraft.data.audio_utils import convert_audio
+
+
+logger = logging.getLogger(__name__)
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .info_audio_dataset import (
     InfoAudioDataset,
@@ -36,7 +46,10 @@ class SoundInfo(SegmentWithAttributes):
     """Segment info augmented with Sound metadata.
     """
     description: tp.Optional[str] = None
-    self_wav: tp.Optional[torch.Tensor] = None
+    self_wav: tp.Optional[WavCondition] = None
+    self_l_wav: tp.Optional[WavCondition] = None
+    l_wav_path: tp.Optional[str] = None
+    negative: tp.Optional[bool] = None
 
     @property
     def has_sound_meta(self) -> bool:
@@ -49,8 +62,10 @@ class SoundInfo(SegmentWithAttributes):
             key, value = _field.name, getattr(self, _field.name)
             if key == 'self_wav':
                 out.wav[key] = value
-            else:
+            elif key == 'description':
                 out.text[key] = value
+            else:
+                pass # ignore other fields
         return out
 
     @staticmethod
@@ -67,13 +82,14 @@ class SoundInfo(SegmentWithAttributes):
 
         # allow a subset of attributes to not be loaded from the dictionary
         # these attributes may be populated later
-        post_init_attributes = ['self_wav']
+        post_init_attributes = ['self_wav', 'joint_embed', 'self_l_wav'] # joint_embed is not used in SoundDataset, but here anyway
+        always_optional = ['negative', 'l_wav_path']
 
         for _field in fields(cls):
             if _field.name in post_init_attributes:
                 continue
             elif _field.name not in dictionary:
-                if fields_required:
+                if fields_required and _field.name not in always_optional:
                     raise KeyError(f"Unexpected missing key: {_field.name}")
             else:
                 preprocess_func: tp.Optional[tp.Callable] = cls.attribute_getter(_field.name)
@@ -92,6 +108,7 @@ class SoundDataset(InfoAudioDataset):
         external_metadata_source (tp.Optional[str]): Folder containing JSON metadata for the corresponding dataset.
             The metadata files contained in this folder are expected to match the stem of the audio file with
             a json extension.
+        metadata_suffixes (str): Suffixes for metadata files. Default is ['.json']. (ex: ".fullcmb.json", ".captiononly.json")
         aug_p (float): Probability of performing audio mixing augmentation on the batch.
         mix_p (float): Proportion of batch items that are mixed together when applying audio mixing augmentation.
         mix_snr_low (int): Lowerbound for SNR value sampled for mixing augmentation.
@@ -106,6 +123,7 @@ class SoundDataset(InfoAudioDataset):
         *args,
         info_fields_required: bool = True,
         external_metadata_source: tp.Optional[str] = None,
+        metadata_suffixes: list[str] = ['.json'],
         aug_p: float = 0.,
         mix_p: float = 0.,
         mix_snr_low: int = -5,
@@ -117,6 +135,7 @@ class SoundDataset(InfoAudioDataset):
         super().__init__(*args, **kwargs)
         self.info_fields_required = info_fields_required
         self.external_metadata_source = external_metadata_source
+        self.metadata_suffixes = metadata_suffixes
         self.aug_p = aug_p
         self.mix_p = mix_p
         if self.aug_p > 0:
@@ -126,33 +145,52 @@ class SoundDataset(InfoAudioDataset):
         self.mix_snr_high = mix_snr_high
         self.mix_min_overlap = mix_min_overlap
 
-    def _get_info_path(self, path: tp.Union[str, Path]) -> Path:
+    def _get_info_path(self, path: tp.Union[str, Path]) -> tp.Optional[Path]:
         """Get path of JSON with metadata (description, etc.).
         If there exists a JSON with the same name as 'path.name', then it will be used.
         Else, such JSON will be searched for in an external json source folder if it exists.
         """
-        info_path = Path(path).with_suffix('.json')
-        if Path(info_path).exists():
-            return info_path
-        elif self.external_metadata_source and (Path(self.external_metadata_source) / info_path.name).exists():
-            return Path(self.external_metadata_source) / info_path.name
+        for suffix in self.metadata_suffixes:
+            info_path = Path(path).with_suffix(suffix)
+            if Path(info_path).exists():
+                return info_path
+            elif self.external_metadata_source and (Path(self.external_metadata_source) / info_path.name).exists():
+                return Path(self.external_metadata_source) / info_path.name
         else:
-            raise Exception(f"Unable to find a metadata JSON for path: {path}")
+        #     raise Exception(f"Unable to find a metadata JSON for path: {path}")
+            return None
 
     def __getitem__(self, index):
-        wav, info = super().__getitem__(index)
+        info: SegmentWithAttributes
+        wav, info = super().__getitem__(index) # type: ignore ( info is always SegmentWithAttributes if self.return_info is True)
         info_data = info.to_dict()
         info_path = self._get_info_path(info.meta.path)
-        if Path(info_path).exists():
-            with open(info_path, 'r') as json_file:
-                sound_data = json.load(json_file)
-                sound_data.update(info_data)
-                sound_info = SoundInfo.from_dict(sound_data, fields_required=self.info_fields_required)
-                # if there are multiple descriptions, sample one randomly
-                if isinstance(sound_info.description, list):
-                    sound_info.description = random.choice(sound_info.description)
+        if info_path is not None and Path(info_path).exists():
+            try:
+                with open(info_path, 'r') as json_file:
+                    sound_data = json.load(json_file)
+                    sound_data.update(info_data)
+                    sound_info = SoundInfo.from_dict(sound_data, fields_required=self.info_fields_required)
+                    # if there are multiple descriptions, sample one randomly
+                    if isinstance(sound_info.description, list):
+                        sound_info.description = random.choice(sound_info.description)
+                    if isinstance(sound_info.l_wav_path, list): # if there are multiple l_wav_paths, sample one randomly
+                        sound_info.l_wav_path = random.choice(sound_info.l_wav_path)
+            except Exception as e:
+                logger.error(f"Error loading metadata from {info_path}")
+                e.args += (f"Error loading metadata from {info_path}",)
+                raise
         else:
             sound_info = SoundInfo.from_dict(info_data, fields_required=False)
+
+
+        lwav_meta = copy.deepcopy(sound_info.meta) # must copy original meta (must not be negative=true)
+        if sound_info.l_wav_path is not None:
+            lwav_meta.path = sound_info.l_wav_path
+            lwav, lwav_info = self.get_preference_l_wav(index, lwav_meta)
+            sound_info.self_l_wav = WavCondition(
+                wav=lwav[None], length=torch.tensor([lwav_info.n_frames]),
+                sample_rate=[sound_info.sample_rate], path=[lwav_meta.path], seek_time=[lwav_info.seek_time])
 
         sound_info.self_wav = WavCondition(
             wav=wav[None], length=torch.tensor([info.n_frames]),
@@ -160,13 +198,72 @@ class SoundDataset(InfoAudioDataset):
 
         return wav, sound_info
 
-    def collater(self, samples):
+    def get_preference_l_wav(self, index, file_meta: AudioMeta) -> tp.Tuple[torch.Tensor, SegmentInfo]:
+        if self.segment_duration is None:
+            out, sr = audio_read(file_meta.path)
+            out = convert_audio(out, sr, self.sample_rate, self.channels)
+            n_frames = out.shape[-1]
+            segment_info = SegmentInfo(file_meta, seek_time=0., n_frames=n_frames, total_frames=n_frames,
+                                       sample_rate=self.sample_rate, channels=out.shape[0])
+        else:
+            rng = torch.Generator()
+            if self.shuffle:
+                # We use index, plus extra randomness, either totally random if we don't know the epoch.
+                # otherwise we make use of the epoch number and optional shuffle_seed.
+                if self.current_epoch is None:
+                    rng.manual_seed(index + self.num_samples * random.randint(0, 2**24))
+                else:
+                    rng.manual_seed(index + self.num_samples * (self.current_epoch + self.shuffle_seed))
+            else:
+                # We only use index
+                rng.manual_seed(index)
+
+            assert self.max_read_retry > 0, "max_read_retry should be at least 1"
+            for retry in range(self.max_read_retry):
+                # We add some variance in the file position even if audio file is smaller than segment
+                # without ending up with empty segments
+                max_seek = max(0, file_meta.duration - self.segment_duration * self.min_segment_ratio)
+                seek_time = torch.rand(1, generator=rng).item() * max_seek
+                try:
+                    out, sr = audio_read(file_meta.path, seek_time, self.segment_duration, pad=False)
+                    out = convert_audio(out, sr, self.sample_rate, self.channels)
+                    n_frames = out.shape[-1]
+                    target_frames = int(self.segment_duration * self.sample_rate)
+                    if self.pad:
+                        out = F.pad(out, (0, target_frames - n_frames))
+                    segment_info = SegmentInfo(file_meta, seek_time, n_frames=n_frames, total_frames=target_frames,
+                                               sample_rate=self.sample_rate, channels=out.shape[0])
+                except Exception as exc:
+                    logger.warning("Error opening file %s: %r", file_meta.path, exc)
+                    if retry == self.max_read_retry - 1:
+                        raise
+                else:
+                    break
+
+        return out, segment_info # type: ignore  max_read_retry always at least 1
+
+    def collater(self, samples, aug_last_n: tp.Optional[int] = None):
         # when training, audio mixing is performed in the collate function
-        wav, sound_info = super().collater(samples)  # SoundDataset always returns infos
+        sound_info: tp.List[SoundInfo]
+        wav, sound_info = super().collater(samples) # type: ignore SoundDataset always returns infos
         if self.aug_p > 0:
-            wav, sound_info = mix_samples(wav, sound_info, self.aug_p, self.mix_p,
+            if aug_last_n is not None:
+                aug_wav = wav[-aug_last_n:]
+                aug_sound_info = sound_info[-aug_last_n:]
+            else:
+                aug_wav = wav
+                aug_sound_info = sound_info
+
+            aug_wav, aug_sound_info = mix_samples(aug_wav, aug_sound_info, self.aug_p, self.mix_p,
                                           snr_low=self.mix_snr_low, snr_high=self.mix_snr_high,
                                           min_overlap=self.mix_min_overlap)
+            if aug_last_n is not None:
+                wav = torch.cat([wav[:-aug_last_n], aug_wav], dim=0)
+                sound_info = sound_info[:-aug_last_n] + aug_sound_info
+            else:
+                wav = aug_wav
+                sound_info = aug_sound_info
+
         return wav, sound_info
 
 
@@ -258,9 +355,13 @@ def snr_mix(src: torch.Tensor, dst: torch.Tensor, snr_low: int, snr_high: int, m
     return mix
 
 
-def mix_text(src_text: str, dst_text: str):
+def mix_text(src_text: tp.Optional[str], dst_text: tp.Optional[str]):
     """Mix text from different sources by concatenating them."""
     if src_text == dst_text:
+        return src_text
+    if src_text is None:
+        return dst_text
+    if dst_text is None:
         return src_text
     return src_text + " " + dst_text
 

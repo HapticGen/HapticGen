@@ -4,6 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
+from dataclasses import dataclass
+import logging
 from pathlib import Path
 import time
 import typing as tp
@@ -15,18 +18,22 @@ import omegaconf
 import torch
 from torch.nn import functional as F
 
+from audiocraft.models.loaders import load_lm_model
+
 from . import base, builders
 from .compression import CompressionSolver
 from .. import metrics as eval_metrics
 from .. import models
 from ..data.audio_dataset import AudioDataset
 from ..data.music_dataset import MusicDataset, MusicInfo, AudioInfo
+from ..data.sound_dataset import SoundDataset, SoundInfo
 from ..data.audio_utils import normalize_audio
 from ..modules.conditioners import JointEmbedCondition, SegmentWithAttributes, WavCondition
 from ..utils.cache import CachedBatchWriter, CachedBatchLoader
 from ..utils.samples.manager import SampleManager
 from ..utils.utils import get_dataset_from_loader, is_jsonable, warn_once, model_hash
 
+logger = logging.getLogger(__name__)
 
 class MusicGenSolver(base.StandardSolver):
     """Solver for MusicGen training task.
@@ -98,8 +105,8 @@ class MusicGenSolver(base.StandardSolver):
         solver.model.eval()
         return solver
 
-    def get_formatter(self, stage_name: str) -> flashy.Formatter:
-        return flashy.Formatter({
+    def get_formatter(self, stage_name: str) -> flashy.Formatter: # type: ignore
+        return flashy.Formatter({ # type: ignore
             'lr': '.2E',
             'ce': '.3f',
             'ppl': '.3f',
@@ -136,9 +143,19 @@ class MusicGenSolver(base.StandardSolver):
                          self.compression_model.frame_rate)
         # instantiate LM model
         self.model: models.LMModel = models.builders.get_lm_model(self.cfg).to(self.device)
+
+        if 'reference_model_statedict' in self.cfg and self.cfg.reference_model_statedict is not None:
+            self.reference_model: tp.Optional[models.LMModel] = load_lm_model(self.cfg.reference_model_statedict, device=self.device)
+            self.reference_model.eval() # should already be set anyway
+            for param in self.reference_model.parameters():
+                param.requires_grad = False # idk if i need this but whatever
+                param.data = param.data.half()
+        else:
+            self.reference_model = None
+
         if self.cfg.fsdp.use:
             assert not self.cfg.autocast, "Cannot use autocast with fsdp"
-            self.model = self.wrap_with_fsdp(self.model)
+            self.model = self.wrap_with_fsdp(self.model) # type: ignore
         self.register_ema('model')
         # initialize optimization
         self.optimizer = builders.get_optimizer(builders.get_optim_parameter_groups(self.model), self.cfg.optim)
@@ -148,7 +165,7 @@ class MusicGenSolver(base.StandardSolver):
         self.autocast_dtype = {
             'float16': torch.float16, 'bfloat16': torch.bfloat16
         }[self.cfg.autocast_dtype]
-        self.scaler: tp.Optional[torch.cuda.amp.GradScaler] = None
+        self.scaler: tp.Optional[torch.cuda.amp.GradScaler] = None # type: ignore
         if self.cfg.fsdp.use:
             need_scaler = self.cfg.fsdp.param_dtype == 'float16'
         else:
@@ -158,7 +175,7 @@ class MusicGenSolver(base.StandardSolver):
                 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
                 self.scaler = ShardedGradScaler()  # type: ignore
             else:
-                self.scaler = torch.cuda.amp.GradScaler()
+                self.scaler = torch.cuda.amp.GradScaler() # type: ignore
             self.register_stateful('scaler')
 
     def build_dataloaders(self) -> None:
@@ -209,9 +226,53 @@ class MusicGenSolver(base.StandardSolver):
         }
         return state
 
+    # based on https://github.com/eric-mitchell/direct-preference-optimization/blob/8a4023f5a5bde957b5d44f687569e075ff54e4f7/trainers.py#L45
+    def _compute_dpo_loss(self,
+                          yw_ce: torch.Tensor,
+                          yl_ce: torch.Tensor,
+                          yw_ref_ce: torch.Tensor,
+                          yl_ref_ce: torch.Tensor,
+                          beta_p: tp.Optional[float] = None,
+                          loss_type_p: tp.Optional[tp.Union[tp.Literal["sigmoid", "robust", "ipo"], str]] = None,
+                          label_smoothing_p: tp.Optional[float] = None,
+                          ) -> torch.Tensor:
+        beta: float = self.cfg.optim.dpo.beta if beta_p is None else beta_p
+        loss_type: tp.Union[tp.Literal["sigmoid", "robust", "ipo"], str] = self.cfg.optim.dpo.loss_type if loss_type_p is None else loss_type_p
+        label_smoothing: float = self.cfg.optim.dpo.label_smoothing if label_smoothing_p is None else label_smoothing_p
+
+        pi_yw_logps, pi_yl_logps = -yw_ce, -yl_ce
+        ref_yw_logps, ref_yl_logps = -yw_ref_ce, -yl_ref_ce
+
+        pi_logratios = pi_yw_logps - pi_yl_logps
+        ref_logratios = ref_yw_logps - ref_yl_logps
+
+        logits = pi_logratios - ref_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
+
+        if loss_type == "ipo":
+            losses = (logits - 1/(2 * beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
+        elif loss_type == "robust":
+            losses = ( -F.logsigmoid(beta * logits) * (1 - label_smoothing) + F.logsigmoid(-beta * logits) * label_smoothing ) / (1 - 2 * label_smoothing) # via https://github.com/huggingface/trl/blob/cbcaa46cd3c02c0e7f724b764c5848ae73796de7/trl/trainer/dpo_trainer.py#L1119
+        elif loss_type == "sigmoid":
+            losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type}")
+
+        # chosen_rewards = beta * (pi_yw_logps - ref_yw_logps).detach()
+        # rejected_rewards = beta * (pi_yl_logps - ref_yl_logps).detach()
+
+        # print(f"losses.shape: {losses.shape}, torch.mean(losses): {torch.mean(losses)}, pi_logratios.shape: {pi_logratios.shape}, torch.mean(pi_logratios): {torch.mean(pi_logratios)}, torch.mean(ref_logratios): {torch.mean(ref_logratios)}, delta: {torch.mean(pi_logratios) - torch.mean(ref_logratios)}")
+
+        return losses #, chosen_rewards, rejected_rewards
+
+    @dataclass
+    class _CEResults:
+        ce: torch.Tensor # [B]
+        ce_wavg: torch.Tensor # []
+        ce_wavg_per_codebook: tp.List[torch.Tensor] # [K]
+
     def _compute_cross_entropy(
-        self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor
-    ) -> tp.Tuple[torch.Tensor, tp.List[torch.Tensor]]:
+        self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, is_negative_bmask: torch.Tensor, bmask: torch.Tensor, negative_weight: float = 1.0
+    ) -> _CEResults:
         """Compute cross entropy between multi-codebook targets and model's logits.
         The cross entropy is computed per codebook to provide codebook-level cross entropy.
         Valid timesteps for each of the codebook are pulled from the mask, where invalid
@@ -221,32 +282,102 @@ class MusicGenSolver(base.StandardSolver):
             logits (torch.Tensor): Model's logits of shape [B, K, T, card].
             targets (torch.Tensor): Target codes, of shape [B, K, T].
             mask (torch.Tensor): Mask for valid target codes, of shape [B, K, T].
+            is_negative_bmask (torch.Tensor): Boolean tensor indicating negative examples, of shape [B].
+            bmask (torch.Tensor): Boolean tensor indicating specific samples for this cross entropy computation, of shape [B].
+            negative_weight (float): Weight for negative samples in the cross entropy computation.
         Returns:
-            ce (torch.Tensor): Cross entropy averaged over the codebooks
-            ce_per_codebook (list of torch.Tensor): Cross entropy per codebook (detached).
+            ce (torch.Tensor): Cross entropy summed over the codebooks
+            ce_wavg (torch.Tensor): Weighted average cross entropy over the codebooks
+            ce_wavg_per_codebook (list[torch.Tensor]): Weighted average cross entropy per codebook
         """
-        B, K, T = targets.shape
-        assert logits.shape[:-1] == targets.shape
-        assert mask.shape == targets.shape
-        ce = torch.zeros([], device=targets.device)
-        ce_per_codebook: tp.List[torch.Tensor] = []
+        targets_pos = targets[bmask & ~is_negative_bmask]
+        logits_pos = logits[bmask & ~is_negative_bmask]
+        mask_pos = mask[bmask & ~is_negative_bmask]
+
+        targets_neg = targets[bmask & is_negative_bmask]
+        logits_neg = logits[bmask & is_negative_bmask]
+        mask_neg = mask[bmask & is_negative_bmask]
+
+        B_pos, K_pos, T_pos = targets_pos.shape
+        assert logits_pos.shape[:-1] == targets_pos.shape
+        assert mask_pos.shape == targets_pos.shape
+
+        B_neg, K_neg, T_neg = targets_neg.shape
+        assert logits_neg.shape[:-1] == targets_neg.shape
+        assert mask_neg.shape == targets_neg.shape
+
+        assert K_pos == K_neg, f"K: {K_pos}, K_neg: {K_neg}"
+        assert T_pos == T_neg, f"T: {T_pos}, T_neg: {T_neg}"
+        K = K_pos
+        T = T_pos
+
+        ce = torch.zeros(B_pos+B_neg, dtype=torch.float32, device=targets_pos.device)
+        ce_wavg = torch.zeros([], device=targets.device)
+        ce_wavg_per_codebook: tp.List[torch.Tensor] = []
         for k in range(K):
-            logits_k = logits[:, k, ...].contiguous().view(-1, logits.size(-1))  # [B x T, card]
-            targets_k = targets[:, k, ...].contiguous().view(-1)  # [B x T]
-            mask_k = mask[:, k, ...].contiguous().view(-1)  # [B x T]
-            ce_targets = targets_k[mask_k]
-            ce_logits = logits_k[mask_k]
-            q_ce = F.cross_entropy(ce_logits, ce_targets)
+            q_ce_pos = torch.zeros((B_pos, T), dtype=torch.half, device=targets_pos.device)
+            q_ce_neg = torch.zeros((B_neg, T), dtype=torch.half, device=targets_pos.device)
+            # q_ce = torch.zeros((B_pos+B_neg), dtype=torch.half, device=targets_pos.device) # we could put them back into original order, but it's not necessary, bmask may not be contiguous anyway
+
+            logits_k_pos = logits_pos[:, k, ...] # [B_pos, T, card]
+            targets_k_pos = targets_pos[:, k, ...] # [B_pos, T]
+            mask_k_pos = mask_pos[:, k, ...] # [B_pos, T]
+
+            logits_k_neg = logits_neg[:, k, ...] # [B_neg, T, card]
+            targets_k_neg = targets_neg[:, k, ...] # [B_neg, T]
+            mask_k_neg = mask_neg[:, k, ...] # [B_neg, T]
+
+            # print(f"logits_k_pos.shape: {logits_k_pos.shape}, targets_k_pos.shape: {targets_k_pos.shape}, mask_k_pos.shape: {mask_k_pos.shape}, logits_k_neg.shape: {logits_k_neg.shape}, targets_k_neg.shape: {targets_k_neg.shape}, mask_k_neg.shape: {mask_k_neg.shape}")
+            ce_targets_pos = targets_k_pos[mask_k_pos]
+            ce_logits_pos = logits_k_pos[mask_k_pos]
+            ce_targets_neg = targets_k_neg[mask_k_neg]
+            ce_logits_neg = logits_k_neg[mask_k_neg]
+            # print(f"ce_targets_pos.shape: {ce_targets_pos.shape}, ce_logits_pos.shape: {ce_logits_pos.shape}, ce_targets_neg.shape: {ce_targets_neg.shape}, ce_logits_neg.shape: {ce_logits_neg.shape}")
+
+            # Calculate cross-entropy for positive samples
+            if len(ce_targets_pos) > 0:
+                q_ce_pos_masked = F.cross_entropy(ce_logits_pos, ce_targets_pos, reduction='none')
+                q_ce_pos.masked_scatter_(mask_k_pos, q_ce_pos_masked)
+
+            # Calculate cross-entropy for negative samples
+            if len(ce_targets_neg) > 0:
+                ce_logits_neg = -ce_logits_neg
+                q_ce_neg_masked = F.cross_entropy(ce_logits_neg, ce_targets_neg, reduction='none')
+                q_ce_neg.masked_scatter_(mask_k_neg, q_ce_neg_masked)
+
+
+            q_ce_pos_summed = q_ce_pos.sum(dim=-1) # [B_pos] sum over T
+            q_ce_pos_divisor = mask_k_pos.count_nonzero(dim=-1).float() # [B_pos] count valid T
+            q_ce_pos_avg = q_ce_pos_summed / q_ce_pos_divisor # [B_pos] average over T
+
+            q_ce_neg_summed = q_ce_neg.sum(dim=-1) # [B_neg] sum over T
+            q_ce_neg_divisor = mask_k_neg.count_nonzero(dim=-1).float() # [B_neg] count valid T
+            q_ce_neg_avg = q_ce_neg_summed / q_ce_neg_divisor # [B_pos] average over T
+
+            q_ce = torch.cat([q_ce_pos_avg, q_ce_neg_avg], dim=0) # [B_pos+B_neg]
+
+            q_ce_wavg = torch.mean(q_ce_pos_avg).nan_to_num() + negative_weight * torch.mean(q_ce_neg_avg).nan_to_num() # nan_to_num to avoid NaNs if len is 0
+
+            # print(f"q_ce_pos_avg: {q_ce_pos_avg}, q_ce_neg_avg: {q_ce_neg_avg}, q_ce: {q_ce}, q_ce_wavg: {q_ce_wavg}")
+
             ce += q_ce
-            ce_per_codebook.append(q_ce.detach())
+            ce_wavg += q_ce_wavg
+            ce_wavg_per_codebook.append(q_ce_wavg.detach())
         # average cross entropy across codebooks
         ce = ce / K
-        return ce, ce_per_codebook
+        ce_wavg = ce_wavg / K
+        return self._CEResults(ce=ce, ce_wavg=ce_wavg, ce_wavg_per_codebook=ce_wavg_per_codebook)
+
+    @dataclass
+    class _TokensAndAttributes:
+        condition_tensors: dict
+        audio_tokens: torch.Tensor
+        padding_mask: torch.Tensor
 
     def _prepare_tokens_and_attributes(
-        self, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
+        self, batch: tp.Tuple[torch.Tensor, tp.Sequence[SegmentWithAttributes]],
         check_synchronization_points: bool = False
-    ) -> tp.Tuple[dict, torch.Tensor, torch.Tensor]:
+    ) -> _TokensAndAttributes:
         """Prepare input batchs for language model training.
 
         Args:
@@ -299,7 +430,7 @@ class MusicGenSolver(base.StandardSolver):
                         info.description = dataset.paraphraser.sample_paraphrase(
                             info.meta.path, info.description)
         # prepare attributes
-        attributes = [info.to_condition_attributes() for info in infos]
+        attributes = [info.to_condition_attributes() for info in infos] # type: ignore
         attributes = self.model.cfg_dropout(attributes)
         attributes = self.model.att_dropout(attributes)
         tokenized = self.model.condition_provider.tokenize(attributes)
@@ -310,7 +441,7 @@ class MusicGenSolver(base.StandardSolver):
 
         if audio_tokens is None:
             with torch.no_grad():
-                audio_tokens, scale = self.compression_model.encode(audio)
+                audio_tokens, scale = self.compression_model.encode(audio) # type: ignore
                 assert scale is None, "Scaled compression model not supported with LM."
 
         with self.autocast:
@@ -325,8 +456,8 @@ class MusicGenSolver(base.StandardSolver):
             token_sample_rate = self.compression_model.frame_rate
             B, K, T_s = audio_tokens.shape
             for i in range(B):
-                n_samples = infos[i].n_frames
-                audio_sample_rate = infos[i].sample_rate
+                n_samples = infos[i].n_frames # type: ignore
+                audio_sample_rate = infos[i].sample_rate # type: ignore
                 # take the last token generated from actual audio frames (non-padded audio)
                 valid_tokens = math.floor(float(n_samples) / audio_sample_rate * token_sample_rate)
                 audio_tokens[i, :, valid_tokens:] = self.model.special_token_id
@@ -347,14 +478,91 @@ class MusicGenSolver(base.StandardSolver):
                 info.audio_tokens = one_audio_tokens.short().cpu()
             self._cached_batch_writer.save(infos)
 
-        return condition_tensors, audio_tokens, padding_mask
+        return self._TokensAndAttributes(condition_tensors=condition_tensors, audio_tokens=audio_tokens, padding_mask=padding_mask)
 
-    def run_step(self, idx: int, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]], metrics: dict) -> dict:
+    @dataclass
+    class _DPOBatchSplits:
+        new_batch: tp.Tuple[torch.Tensor, tp.Sequence[SegmentWithAttributes]]
+        dpo_yl_bmask: torch.Tensor
+        dpo_yw_bmask: torch.Tensor
+        nondpo_bmask: torch.Tensor
+        is_negative_bmask: torch.Tensor
+        dpo_any: bool
+        nondpo_any: bool
+
+
+    def _create_dpo_batch_splits(self, infos: tp.List[SoundInfo]) -> _DPOBatchSplits:
+        assert self.current_dataloader is not None
+        if isinstance(self.current_dataloader.dataset, SoundDataset):
+            curr_dataset = self.current_dataloader.dataset
+        elif isinstance(self.current_dataloader.dataset.dataset, SoundDataset): # if self.current_dataloader.dataset is torch.utils.data.dataset.Subset
+            curr_dataset = self.current_dataloader.dataset.dataset
+        else:
+            raise RuntimeError(f"Could not find SoundDataset in current_dataloader.dataset, got {type(self.current_dataloader.dataset)}")
+
+        dpo_l_list, dpo_w_list, nondpo_list = [], [], []
+        for info in infos:
+            has_dpo = bool(hasattr(info, "self_l_wav") and info.self_l_wav is not None)
+            if has_dpo:
+                assert has_dpo and not info.negative, "If sample's meta supports DPO, it should be the positive example."
+                assert info.self_wav is not None and info.self_l_wav is not None
+                dpo_l_list.append((info.self_l_wav.wav[0], info))
+                dpo_w_list.append((info.self_wav.wav[0], info))
+            else:
+                assert info.self_wav is not None
+                nondpo_list.append((info.self_wav.wav[0], info))
+
+        new_batch_samples = dpo_l_list + dpo_w_list + nondpo_list
+        new_batch: tp.Tuple[torch.Tensor, tp.Sequence[SegmentWithAttributes]] = curr_dataset.collater(new_batch_samples, aug_last_n=len(nondpo_list))
+        # if augmentation, number of nondpo samples may change
+        num_nondpo_samples = len(new_batch[1]) - len(dpo_l_list) - len(dpo_w_list)
+        dpo_yl_bmask = torch.tensor([True ] * len(dpo_l_list) + [False] * len(dpo_w_list) + [False] * num_nondpo_samples, device=self.device, dtype=torch.bool)
+        dpo_yw_bmask = torch.tensor([False] * len(dpo_l_list) + [True ] * len(dpo_w_list) + [False] * num_nondpo_samples, device=self.device, dtype=torch.bool)
+        nondpo_bmask = torch.tensor([False] * len(dpo_l_list) + [False] * len(dpo_w_list) + [True ] * num_nondpo_samples, device=self.device, dtype=torch.bool)
+
+        assert len(dpo_l_list) == len(dpo_w_list)
+        dpo_any = len(dpo_l_list) > 0
+        nondpo_any = num_nondpo_samples > 0
+        # if dpo_any:
+        #     assert curr_dataset.aug_p == 0.0, f"DPO may not work well with mixing augmentations set to 0.0, got {curr_dataset.aug_p}" # aug_last_n is set to len(nondpo_list) so this should be fine
+
+        is_negative_bmask = torch.tensor([bool(hasattr(info, "negative") and info.negative) for info in new_batch[1]], device=self.device, dtype=torch.bool)
+
+        return self._DPOBatchSplits(new_batch=new_batch, dpo_yl_bmask=dpo_yl_bmask, dpo_yw_bmask=dpo_yw_bmask, nondpo_bmask=nondpo_bmask, is_negative_bmask=is_negative_bmask, dpo_any=dpo_any, nondpo_any=nondpo_any)
+
+    def _compute_predictions_and_ce_for_bmasks(self,
+                                   model: models.LMModel,
+                                   audio_tokens: torch.Tensor,
+                                   condition_tensors: dict,
+
+                                   padding_mask: torch.Tensor,
+                                   is_negative_bmask: torch.Tensor,
+
+                                   ce_bmasks: tp.Sequence[torch.Tensor],
+                                   ):
+        model_output = model.compute_predictions(audio_tokens, [], condition_tensors)
+        logits = model_output.logits
+        mask = padding_mask & model_output.mask
+
+        ces_for_bmasks = [self._compute_cross_entropy(logits=logits, targets=audio_tokens, mask=mask,
+                                                      is_negative_bmask=is_negative_bmask, bmask=bmask,
+                                                      negative_weight=self.cfg.optim.negative_sample_weight) for bmask in ce_bmasks]
+
+        return ces_for_bmasks
+
+
+    def run_step(self, idx: int, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]], metrics: dict) -> dict: # type: ignore
         """Perform one training or valid step on a given batch."""
         check_synchronization_points = idx == 1 and self.device == 'cuda'
 
-        condition_tensors, audio_tokens, padding_mask = self._prepare_tokens_and_attributes(
-            batch, check_synchronization_points)
+        assert not self.cfg.cache.path and not self._cached_batch_loader and not self._cached_batch_writer # DPO is not tested with batch cache
+
+        assert all([isinstance(info, SoundInfo) for info in batch[1]])
+        infos: tp.List[SoundInfo] = batch[1] # type: ignore asserted above
+
+        dpobs = self._create_dpo_batch_splits(infos) # perf todo: check for check_synchronization_points in here too
+        new_batch, dpo_yl_bmask, dpo_yw_bmask, nondpo_bmask, is_negative_bmask, dpo_any, nondpo_any = dpobs.new_batch, dpobs.dpo_yl_bmask, dpobs.dpo_yw_bmask, dpobs.nondpo_bmask, dpobs.is_negative_bmask, dpobs.dpo_any, dpobs.nondpo_any
+        nb_ta = self._prepare_tokens_and_attributes(new_batch, check_synchronization_points)
 
         self.deadlock_detect.update('tokens_and_conditions')
 
@@ -362,11 +570,48 @@ class MusicGenSolver(base.StandardSolver):
             torch.cuda.set_sync_debug_mode('warn')
 
         with self.autocast:
-            model_output = self.model.compute_predictions(audio_tokens, [], condition_tensors)  # type: ignore
-            logits = model_output.logits
-            mask = padding_mask & model_output.mask
-            ce, ce_per_codebook = self._compute_cross_entropy(logits, audio_tokens, mask)
-            loss = ce
+            dpo_yl_ce_tuple, dpo_yw_ce_tuple, nondpo_ce_tuple = self._compute_predictions_and_ce_for_bmasks(self.model, nb_ta.audio_tokens, nb_ta.condition_tensors, nb_ta.padding_mask, is_negative_bmask, [dpo_yl_bmask, dpo_yw_bmask, nondpo_bmask])
+            stats_ce_tuples: tp.List[MusicGenSolver._CEResults] = []
+            if dpo_any:
+                assert self.reference_model is not None, "DPO samples require a reference model"
+                stats_ce_tuples.append(dpo_yw_ce_tuple)
+
+                # perf: could potentially skip nondpo for reference model? need to adjust all inputs for new batch size
+                dpo_yl_ref_ce_tuple, dpo_yw_ref_ce_tuple, nondpo_ref_ce_tuple = self._compute_predictions_and_ce_for_bmasks(self.reference_model, nb_ta.audio_tokens, nb_ta.condition_tensors, nb_ta.padding_mask, is_negative_bmask, [dpo_yl_bmask, dpo_yw_bmask, nondpo_bmask])
+
+                dpo_losses = self._compute_dpo_loss(
+                    yw_ce=dpo_yw_ce_tuple.ce,
+                    yl_ce=dpo_yl_ce_tuple.ce,
+                    yw_ref_ce=dpo_yw_ref_ce_tuple.ce,
+                    yl_ref_ce=dpo_yl_ref_ce_tuple.ce,
+                )
+                dpo_loss = torch.mean(dpo_losses) + self.cfg.optim.dpo.ce_mix_beta * torch.mean(dpo_yw_ce_tuple.ce) # we dont include the YL CE because it is calculated using the normal CE calc instead of the flipped logits calc used for negative samples.
+            else:
+                dpo_loss = None
+
+            if nondpo_any:
+                stats_ce_tuples.append(nondpo_ce_tuple)
+                nondpo_ce_loss = nondpo_ce_tuple.ce_wavg
+            else:
+                nondpo_ce_loss = None
+
+            # for metrics:
+            ce_for_metrics = torch.mean(torch.stack([cer.ce_wavg for cer in stats_ce_tuples]))
+            ce_per_codebook_for_metrics = [torch.mean(torch.stack([cer.ce_wavg_per_codebook[k] for cer in stats_ce_tuples])) for k in range(self.compression_model.num_codebooks)]
+            if dpo_loss is not None:
+                dpo_loss_for_metrics = dpo_loss
+            else:
+                dpo_loss_for_metrics = torch.zeros((), device=self.device)
+
+            if dpo_loss is not None and nondpo_ce_loss is not None:
+                loss = dpo_loss + nondpo_ce_loss
+            elif dpo_loss is not None and nondpo_ce_loss is None:
+                loss = dpo_loss
+            elif dpo_loss is None and nondpo_ce_loss is not None:
+                loss = nondpo_ce_loss
+            else:
+                raise RuntimeError("No loss computable")
+
         self.deadlock_detect.update('loss')
 
         if check_synchronization_points:
@@ -375,7 +620,7 @@ class MusicGenSolver(base.StandardSolver):
         if self.is_training:
             metrics['lr'] = self.optimizer.param_groups[0]['lr']
             if self.scaler is not None:
-                loss = self.scaler.scale(loss)
+                loss: torch.Tensor = self.scaler.scale(loss) # type: ignore
             self.deadlock_detect.update('scale')
             if self.cfg.fsdp.use:
                 loss.backward()
@@ -396,7 +641,7 @@ class MusicGenSolver(base.StandardSolver):
                 if self.cfg.fsdp.use:
                     metrics['grad_norm'] = self.model.clip_grad_norm_(self.cfg.optim.max_norm)  # type: ignore
                 else:
-                    metrics['grad_norm'] = torch.nn.utils.clip_grad_norm_(
+                    metrics['grad_norm'] = torch.nn.utils.clip_grad_norm_( # type: ignore
                         self.model.parameters(), self.cfg.optim.max_norm
                     )
             if self.scaler is None:
@@ -414,11 +659,15 @@ class MusicGenSolver(base.StandardSolver):
             if not loss.isfinite().all():
                 raise RuntimeError("Model probably diverged.")
 
+
+        ce = ce_for_metrics
+        ce_per_codebook = ce_per_codebook_for_metrics
         metrics['ce'] = ce
         metrics['ppl'] = torch.exp(ce)
         for k, ce_q in enumerate(ce_per_codebook):
             metrics[f'ce_q{k + 1}'] = ce_q
             metrics[f'ppl_q{k + 1}'] = torch.exp(ce_q)
+        metrics['dpo_loss'] = dpo_loss_for_metrics
 
         return metrics
 
@@ -537,7 +786,7 @@ class MusicGenSolver(base.StandardSolver):
             return hydrated_conditions
 
         metrics: dict = {}
-        average = flashy.averager()
+        average = flashy.averager() # type: ignore
         for batch in lp:
             audio, meta = batch
             # metadata for sample manager
@@ -574,13 +823,13 @@ class MusicGenSolver(base.StandardSolver):
                     prompt_wavs=prompt_audio, ground_truth_wavs=audio,
                     generation_args=sample_generation_params)
 
-            metrics['rtf'] = rtf
+            metrics['rtf'] = rtf # type: ignore
             metrics = average(metrics)
 
         flashy.distrib.barrier()
         return metrics
 
-    def generate(self) -> dict:
+    def generate(self) -> dict: # type: ignore
         """Generate stage."""
         self.model.eval()
         with torch.no_grad():
@@ -639,14 +888,14 @@ class MusicGenSolver(base.StandardSolver):
         def get_compressed_audio(audio: torch.Tensor) -> torch.Tensor:
             audio_tokens, scale = self.compression_model.encode(audio.to(self.device))
             compressed_audio = self.compression_model.decode(audio_tokens, scale)
-            return compressed_audio[..., :audio.shape[-1]]
+            return compressed_audio[..., :audio.shape[-1]] # type: ignore
 
         metrics: dict = {}
         if should_run_eval:
             loader = self.dataloaders['evaluate']
             updates = len(loader)
             lp = self.log_progress(f'{evaluate_stage_name} inference', loader, total=updates, updates=self.log_updates)
-            average = flashy.averager()
+            average = flashy.averager() # type: ignore
             dataset = get_dataset_from_loader(loader)
             assert isinstance(dataset, AudioDataset)
             self.logger.info(f"Computing evaluation metrics on {len(dataset)} samples")
@@ -710,7 +959,7 @@ class MusicGenSolver(base.StandardSolver):
 
         return metrics
 
-    def evaluate(self) -> dict:
+    def evaluate(self) -> dict: # type: ignore
         """Evaluate stage."""
         self.model.eval()
         with torch.no_grad():

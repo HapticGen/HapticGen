@@ -14,7 +14,7 @@ import typing as tp
 
 import torch
 
-from .audio_dataset import AudioDataset, AudioMeta
+from .audio_dataset import AudioDataset, AudioMeta, SegmentInfo
 from ..environment import AudioCraftEnvironment
 from ..modules.conditioners import SegmentWithAttributes, ConditioningAttributes
 
@@ -64,7 +64,8 @@ class InfoAudioDataset(AudioDataset):
             wav = super().__getitem__(index)
             assert isinstance(wav, torch.Tensor)
             return wav
-        wav, meta = super().__getitem__(index)
+        meta: SegmentInfo
+        wav, meta = super().__getitem__(index) # type: ignore
         return wav, AudioInfo(**meta.to_dict())
 
 

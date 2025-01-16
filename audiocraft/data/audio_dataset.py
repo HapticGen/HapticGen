@@ -455,9 +455,9 @@ class AudioDataset:
 
         if self.return_info:
             # Returns the wav and additional information on the wave segment
-            return out, segment_info
+            return out, segment_info # type: ignore
         else:
-            return out
+            return out # type: ignore
 
     def collater(self, samples):
         """The collater function has to be provided to the dataloader
@@ -477,9 +477,9 @@ class AudioDataset:
 
         if self.return_info:
             if len(samples) > 0:
-                assert len(samples[0]) == 2
-                assert isinstance(samples[0][0], torch.Tensor)
-                assert isinstance(samples[0][1], SegmentInfo)
+                assert len(samples[0]) == 2, f"Expected tuple of (wav, SegmentInfo), got {samples[0]}"
+                assert isinstance(samples[0][0], torch.Tensor), f"Expected torch.Tensor, got {type(samples[0][0])}"
+                assert isinstance(samples[0][1], SegmentInfo), f"Expected SegmentInfo, got {type(samples[0][1])}"
 
             wavs = [wav for wav, _ in samples]
             segment_infos = [copy.deepcopy(info) for _, info in samples]
@@ -488,15 +488,15 @@ class AudioDataset:
                 # Each wav could be of a different duration as they are not segmented.
                 for i in range(len(samples)):
                     # Determines the total length of the signal with padding, so we update here as we pad.
-                    segment_infos[i].total_frames = max_len
-                    wavs[i] = _pad_wav(wavs[i])
+                    segment_infos[i].total_frames = max_len # type: ignore
+                    wavs[i] = _pad_wav(wavs[i]) # type: ignore
 
             wav = torch.stack(wavs)
             return wav, segment_infos
         else:
             assert isinstance(samples[0], torch.Tensor)
             if to_pad:
-                samples = [_pad_wav(s) for s in samples]
+                samples = [_pad_wav(s) for s in samples] # type: ignore
             return torch.stack(samples)
 
     def _filter_duration(self, meta: tp.List[AudioMeta]) -> tp.List[AudioMeta]:

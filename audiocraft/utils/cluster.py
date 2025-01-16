@@ -25,6 +25,9 @@ class ClusterType(Enum):
 
 
 def _guess_cluster_type() -> ClusterType:
+    if not hasattr(os, "uname"): # probably windows
+        return ClusterType.DEFAULT
+
     uname = os.uname()
     fqdn = socket.getfqdn()
     if uname.sysname == "Linux" and (uname.release.endswith("-aws") or ".ec2" in fqdn):

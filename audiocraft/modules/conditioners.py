@@ -413,7 +413,7 @@ class T5Conditioner(TextConditioner):
             warnings.simplefilter("ignore")
             try:
                 self.t5_tokenizer = T5Tokenizer.from_pretrained(name)
-                t5 = T5EncoderModel.from_pretrained(name).train(mode=finetune)
+                t5 = T5EncoderModel.from_pretrained(name).train(mode=finetune) # type: ignore
             finally:
                 logging.disable(previous_level)
         if finetune:
@@ -421,7 +421,7 @@ class T5Conditioner(TextConditioner):
         else:
             # this makes sure that the t5 models is not part
             # of the saved checkpoint
-            self.__dict__['t5'] = t5.to(device)
+            self.__dict__['t5'] = t5.to(device) # type: ignore
 
         self.normalize_text = normalize_text
         if normalize_text:
@@ -431,7 +431,7 @@ class T5Conditioner(TextConditioner):
         # if current sample doesn't have a certain attribute, replace with empty string
         entries: tp.List[str] = [xi if xi is not None else "" for xi in x]
         if self.normalize_text:
-            _, _, entries = self.text_normalizer(entries, return_text=True)
+            _, _, entries = self.text_normalizer(entries, return_text=True) # type: ignore
         if self.word_dropout > 0. and self.training:
             new_entries = []
             for entry in entries:
@@ -485,7 +485,7 @@ class WaveformConditioner(BaseConditioner):
         """Returns the downsampling factor of the embedding model."""
         raise NotImplementedError()
 
-    def forward(self, x: WavCondition) -> ConditionType:
+    def forward(self, x: WavCondition) -> ConditionType: # type: ignore
         """Extract condition embedding and mask from a waveform and its metadata.
         Args:
             x (WavCondition): Waveform condition containing raw waveform and metadata.
@@ -572,7 +572,7 @@ class ChromaStemConditioner(WaveformConditioner):
             sample_rate=self.sample_rate, channels=1)
 
         if len(dataset) > 0:
-            eval_wavs = dataset.collater([dataset[i] for i in range(num_samples)]).to(self.device)
+            eval_wavs = dataset.collater([dataset[i] for i in range(num_samples)]).to(self.device) # type: ignore
             logger.info(f"Using {len(eval_wavs)} evaluation wavs for chroma-stem conditioner")
             return eval_wavs
         else:
@@ -740,7 +740,7 @@ class JointEmbeddingConditioner(BaseConditioner):
         """
         raise NotImplementedError()
 
-    def forward(self, x: JointEmbedCondition) -> ConditionType:
+    def forward(self, x: JointEmbedCondition) -> ConditionType: # type: ignore
         with self.autocast:
             embed, empty_idx = self._get_embed(x)
             if self.quantizer is not None:
@@ -829,7 +829,7 @@ class CLAPEmbeddingConditioner(JointEmbeddingConditioner):
 
     def _tokenizer(self, texts: tp.Union[str, tp.List[str]]) -> dict:
         # we use the default params from CLAP module here as well
-        return self.clap_tokenize(texts, padding="max_length", truncation=True, max_length=77, return_tensors="pt")
+        return self.clap_tokenize(texts, padding="max_length", truncation=True, max_length=77, return_tensors="pt") # type: ignore
 
     def _compute_text_embedding(self, text: tp.List[str]) -> torch.Tensor:
         """Compute text embedding from CLAP model on a given a batch of text.

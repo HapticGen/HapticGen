@@ -76,7 +76,7 @@ class ResidualVectorQuantizer(BaseQuantizer):
     def forward(self, x: torch.Tensor, frame_rate: int):
         n_q = self.n_q
         if self.training and self.q_dropout:
-            n_q = int(torch.randint(1, self.n_q + 1, (1,)).item())
+            n_q = int(torch.randint(1, self.n_q + 1, (1,)).item()) # dropout last codebooks to encourage the first layers to capture more information?
         bw_per_q = math.log2(self.bins) * frame_rate / 1000
         quantized, codes, commit_loss = self.vq(x, n_q=n_q)
         codes = codes.transpose(0, 1)

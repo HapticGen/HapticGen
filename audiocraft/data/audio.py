@@ -158,7 +158,7 @@ def _piping_to_ffmpeg(out_path: tp.Union[str, Path], wav: torch.Tensor, sample_r
 
 def audio_write(stem_name: tp.Union[str, Path],
                 wav: torch.Tensor, sample_rate: int,
-                format: str = 'wav', mp3_rate: int = 320, ogg_rate: tp.Optional[int] = None,
+                format: str = 'wav', mp3_rate: int = 320, ogg_rate: tp.Optional[int] = None, wav_fmt: str = "pcm_s16le",
                 normalize: bool = True, strategy: str = 'peak', peak_clip_headroom_db: float = 1,
                 rms_headroom_db: float = 18, loudness_headroom_db: float = 14,
                 loudness_compressor: bool = False,
@@ -205,7 +205,7 @@ def audio_write(stem_name: tp.Union[str, Path],
         flags = ['-f', 'mp3', '-c:a', 'libmp3lame', '-b:a', f'{mp3_rate}k']
     elif format == 'wav':
         suffix = '.wav'
-        flags = ['-f', 'wav', '-c:a', 'pcm_s16le']
+        flags = ['-f', 'wav', '-c:a', wav_fmt]
     elif format == 'ogg':
         suffix = '.ogg'
         flags = ['-f', 'ogg', '-c:a', 'libvorbis']

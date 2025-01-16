@@ -24,7 +24,7 @@ from ..utils.profiler import Profiler
 from ..utils.utils import copy_state, dict_from_config, model_hash, with_rank_rng
 
 
-class StandardSolver(ABC, flashy.BaseSolver):
+class StandardSolver(ABC, flashy.BaseSolver): # type: ignore
     """Standard solver for AudioCraft.
 
     The standard solver implements a base training loop with the following stages:
@@ -47,6 +47,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
         self._ema_sources: nn.ModuleDict = nn.ModuleDict()
         self.ema: tp.Optional[optim.ModuleDictEMA] = None
         self.dataloaders: tp.Dict[str, torch.utils.data.DataLoader] = dict()
+        self.current_dataloader: tp.Optional[torch.utils.data.DataLoader] = None
         self._log_updates = self.cfg.logging.get('log_updates', 10)
         if self.cfg.logging.log_tensorboard:
             self.init_tensorboard(**self.cfg.get('tensorboard'))
@@ -97,9 +98,9 @@ class StandardSolver(ABC, flashy.BaseSolver):
     @property
     def autocast(self):
         """Convenient autocast (or not) using the solver configuration."""
-        return TorchAutocast(enabled=self.cfg.autocast, device_type=self.device, dtype=self.autocast_dtype)
+        return TorchAutocast(enabled=self.cfg.autocast, device_type=self.device, dtype=self.autocast_dtype) # type: ignore
 
-    def _get_state_source(self, name) -> flashy.state.StateDictSource:
+    def _get_state_source(self, name) -> flashy.state.StateDictSource: # type: ignore
         # Internal utility to get a state source from the solver
         return self.stateful.sources[name]
 
@@ -267,7 +268,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
         # convenient access to log updates
         return self._log_updates
 
-    def checkpoint_path(self, **kwargs):
+    def checkpoint_path(self, **kwargs): # type: ignore
         kwargs.setdefault('use_fsdp', self.cfg.fsdp.use)
         return self.folder / checkpoint.checkpoint_name(**kwargs)
 
@@ -453,7 +454,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
                                                     formatter=self.get_formatter(stage_name))
         return restored_checkpoints is not None
 
-    def commit(self, save_checkpoints: bool = True):
+    def commit(self, save_checkpoints: bool = True): # type: ignore
         """Commit metrics to dora and save checkpoints at the end of an epoch."""
         # we override commit to introduce more complex checkpoint saving behaviors
         self.history.append(self._pending_metrics)  # This will increase self.epoch
@@ -519,6 +520,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
         self.model.train(self.is_training)
 
         loader = self.dataloaders[dataset_split]
+        self.current_dataloader = loader
         # get a different order for distributed training, otherwise this will get ignored
         if flashy.distrib.world_size() > 1 \
            and isinstance(loader.sampler, torch.utils.data.distributed.DistributedSampler):
@@ -529,8 +531,8 @@ class StandardSolver(ABC, flashy.BaseSolver):
             batch = next(iter(loader))
             loader = [batch] * updates_per_epoch  # type: ignore
         lp = self.log_progress(self.current_stage, loader, total=updates_per_epoch, updates=self.log_updates)
-        average = flashy.averager()  # epoch wise average
-        instant_average = flashy.averager()  # average between two logging
+        average = flashy.averager()  # type: ignore # epoch wise average
+        instant_average = flashy.averager()  # type: ignore # average between two logging
         metrics: dict = {}
 
         with self.profiler, self.deadlock_detect:  # profiler will only run for the first 20 updates.
@@ -539,7 +541,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
                 if idx >= updates_per_epoch:
                     break
                 metrics = {}
-                metrics = self.run_step(idx, batch, metrics)
+                metrics = self.run_step(idx, batch, metrics) # type: ignore
                 self.deadlock_detect.update('step')
                 # run EMA step
                 if self.ema is not None and self.is_training and (idx + 1) % self.cfg.optim.ema.updates == 0:
@@ -549,7 +551,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
                 self.profiler.step()
                 instant_metrics = instant_average(metrics)
                 if lp.update(**instant_metrics):
-                    instant_average = flashy.averager()  # reset averager between two logging
+                    instant_average = flashy.averager()  # type: ignore # reset averager between two logging
                 metrics = average(metrics)  # epoch wise average
                 self.deadlock_detect.update('end_batch')
 

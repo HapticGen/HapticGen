@@ -60,3 +60,10 @@ dataset/*
 /notebooks
 /local_scripts
 /notes
+
+agtrain*.log
+slurm.*.err
+slurm.*.out
+beamcloud*.wav
+*.temp
+old-*.log

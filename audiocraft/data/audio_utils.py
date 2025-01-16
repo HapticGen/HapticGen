@@ -94,7 +94,7 @@ def _clip_wav(wav: torch.Tensor, log_clipping: bool = False, stem_name: tp.Optio
 
 
 def normalize_audio(wav: torch.Tensor, normalize: bool = True,
-                    strategy: str = 'peak', peak_clip_headroom_db: float = 1,
+                    strategy: str = 'peak', peak_clip_headroom_db: float = 1, peak_normalize_db_clamp: float = 0,
                     rms_headroom_db: float = 18, loudness_headroom_db: float = 14,
                     loudness_compressor: bool = False, log_clipping: bool = False,
                     sample_rate: tp.Optional[int] = None,
@@ -110,6 +110,7 @@ def normalize_audio(wav: torch.Tensor, normalize: bool = True,
             i.e. audio is normalized by its largest value. RMS normalizes by root-mean-square
             with extra headroom to avoid clipping. 'clip' just clips.
         peak_clip_headroom_db (float): Headroom in dB when doing 'peak' or 'clip' strategy.
+        peak_normalize_db_clamp (float): Maximum normalization in dB when doing 'peak' strategy (e.g. set to -20 dB for max amplify to 0.1).
         rms_headroom_db (float): Headroom in dB when doing 'rms' strategy. This must be much larger
             than the `peak_clip` one to avoid further clipping.
         loudness_headroom_db (float): Target loudness for loudness normalization.
@@ -122,9 +123,11 @@ def normalize_audio(wav: torch.Tensor, normalize: bool = True,
         torch.Tensor: Normalized audio.
     """
     scale_peak = 10 ** (-peak_clip_headroom_db / 20)
+    normalize_peak = 10 ** (peak_normalize_db_clamp / 20)
     scale_rms = 10 ** (-rms_headroom_db / 20)
     if strategy == 'peak':
-        rescaling = (scale_peak / wav.abs().max())
+        wav_max = wav.abs().max()
+        rescaling = (scale_peak / wav_max).clamp(max=(normalize_peak / wav_max).clamp(min=1))
         if normalize or rescaling < 1:
             wav = wav * rescaling
     elif strategy == 'clip':
@@ -154,6 +157,8 @@ def f32_pcm(wav: torch.Tensor) -> torch.Tensor:
         return wav.float() / 2**15
     elif wav.dtype == torch.int32:
         return wav.float() / 2**31
+    elif wav.dtype == torch.uint8:
+        return (wav.float() - 128) / 128
     raise ValueError(f"Unsupported wav dtype: {wav.dtype}")
 
 
