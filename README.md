@@ -6,8 +6,8 @@ HapticGen is a generative model designed to create vibrotactile haptic signals f
 This repository contains modifications to Meta Research's [AudioCraft](https://github.com/facebookresearch/audiocraft), primarily in the dataloader and solver components, used to train and fine-tune the HapticGen model.
 
 ## Installation
-The installation process is similar to AudioCraft. Please refer to the [README-audiocraft.md](README-audiocraft.md) for detailed instructions.
-The required dependencies can be found in [requirements.txt](requirements.txt) or [requirements.beamcloud.txt](requirements.beamcloud.txt).
+The installation process is similar to AudioCraft, but some dependencies have changed. For detailed instructions, please refer to [README-audiocraft.md](README-audiocraft.md).
+The current required dependencies can be found in [requirements.txt](requirements.txt) or [requirements.beamcloud.txt](requirements.beamcloud.txt).
 
 ## Training
 To train and fine-tune the HapticGen model as discussed in the paper, refer to the [HapticGen grid](./audiocraft/grids/hapticgen/hapticgen_minimal.py).
